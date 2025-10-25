@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 DOCX RAG Chatbot — LangChain + FAISS + Streamlit
-- 多文件上传（.docx），有效性校验（防 BadZipFile）
-- 中文友好切分
-- 相似度阈值过滤 + MMR 去冗余
-- 构建向量索引带进度条、等待提示
-- 会话缓存（一次索引，多轮问答）
-- 安全读取配置：优先环境变量，再尝试 st.secrets
+- Multiple .docx uploads with validation (avoid BadZipFile)
+- Chinese-friendly splitting (compatible with multilingual docs)
+- Similarity threshold filter + MMR deduplication
+- Build FAISS vector index with progress bar and loading indicator
+- Session cache (one-time indexing, multi-turn QA)
+- Secure configuration reading: environment variable > st.secrets
 """
 
 import os
@@ -21,7 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain.schema import AIMessage
 
 # -----------------------------
-# 页面基础配置与样式
+# Page configuration & styles
 # -----------------------------
 st.set_page_config(
     page_title="DOCX RAG Chatbot",
@@ -30,28 +30,24 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# 轻度美化
+# Light UI styling
 st.markdown("""
 <style>
-/* 顶部标题缩小留白 */
 .block-container {padding-top: 1.3rem; padding-bottom: 2rem;}
-/* 聊天消息内容更易读 */
 .stChatMessage p {font-size:1.02rem; line-height:1.6;}
-/* 侧栏标题间距 */
 section[data-testid="stSidebar"] .st-emotion-cache-1vt4y43 {margin-bottom: 0.5rem;}
-/* 代码块更紧凑 */
 code, pre {font-size: 0.92rem;}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🧠 DOCX RAG Chatbot")
-st.caption("LangChain + FAISS + Streamlit（支持多文档、MMR、相似度阈值、进度条）")
+st.caption("LangChain + FAISS + Streamlit (supports multi-doc, MMR, similarity threshold, progress bar)")
 
 # -----------------------------
-# 工具函数
+# Utility functions
 # -----------------------------
 def read_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    """安全读取配置：环境变量优先，再尝试 st.secrets；都无则给默认值"""
+    """Safely read configs: prefer env vars, fallback to st.secrets, or use default."""
     v = os.environ.get(name)
     if v:
         return v
@@ -61,7 +57,7 @@ def read_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         return default
 
 def is_valid_docx_bytes(b: bytes) -> bool:
-    """docx 本质是 zip，前两个字节为 'PK'"""
+    """A valid .docx file starts with 'PK' since it's a zip archive."""
     return b[:2] == b"PK"
 
 def load_docs_from_uploads(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile]):
@@ -71,7 +67,7 @@ def load_docs_from_uploads(uploaded_files: List[st.runtime.uploaded_file_manager
     for uf in uploaded_files:
         raw = uf.read()
         if not is_valid_docx_bytes(raw):
-            st.warning(f"⚠️ `{uf.name}` 不是有效的 .docx（或已损坏），已跳过。")
+            st.warning(f"⚠️ `{uf.name}` is not a valid .docx (or corrupted). Skipped.")
             continue
         path = os.path.join(tmp_dir, uf.name)
         with open(path, "wb") as f:
@@ -83,15 +79,15 @@ def split_documents(docs, chunk_size: int, chunk_overlap: int):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", "。", "！", "？", "；", "，", "、", " ", ""],
+        separators=["\n\n", "\n", ".", "!", "?", ";", ",", " ", ""],
     )
     return splitter.split_documents(docs)
 
 def build_vectordb_with_progress(splits, embed_model: str, base_url: str, api_key: str) -> FAISS:
     if not splits:
-        raise ValueError("没有可索引的文本片段。")
+        raise ValueError("No text chunks available for indexing.")
 
-    progress = st.progress(0.0, text="正在向量化与建立索引…（启动中）")
+    progress = st.progress(0.0, text="Embedding and building FAISS index… (initializing)")
     status = st.empty()
 
     embeddings = OpenAIEmbeddings(model=embed_model, base_url=base_url, api_key=api_key)
@@ -100,27 +96,26 @@ def build_vectordb_with_progress(splits, embed_model: str, base_url: str, api_ke
     batch_size = max(16, min(128, total // 10 or 16))
 
     first = splits[:batch_size]
-    status.info(f"索引初始化…（1/{(total-1)//batch_size + 1} 批）")
+    status.info(f"Initializing index… (1/{(total-1)//batch_size + 1} batches)")
     vectordb = FAISS.from_documents(first, embeddings)
     built = len(first)
-    progress.progress(min(0.08 + 0.80 * (built/total), 0.95), text=f"已建立 {built}/{total} 个片段…")
+    progress.progress(min(0.08 + 0.80 * (built/total), 0.95), text=f"Indexed {built}/{total} chunks…")
 
     while built < total:
         end = min(built + batch_size, total)
         batch = splits[built:end]
-        status.info(f"增量索引…（{end//batch_size + (1 if end%batch_size else 0)}/{(total-1)//batch_size + 1} 批）")
-        # ✅ 修复：新版 LangChain 不再需要传 embeddings
+        status.info(f"Incremental indexing… ({end//batch_size + (1 if end%batch_size else 0)}/{(total-1)//batch_size + 1} batches)")
         vectordb.add_documents(batch)
         built = end
-        progress.progress(min(0.08 + 0.80 * (built/total), 0.98), text=f"已建立 {built}/{total} 个片段…")
+        progress.progress(min(0.08 + 0.80 * (built/total), 0.98), text=f"Indexed {built}/{total} chunks…")
 
-    progress.progress(1.0, text="索引完成 ✅")
+    progress.progress(1.0, text="Indexing completed ✅")
     progress.empty()
     status.empty()
     return vectordb
 
 def retrieve_docs(vdb: FAISS, query: str, top_k: int, use_mmr: bool, dist_threshold: Optional[float]):
-    # 先尝试“距离阈值”过滤（FAISS 分数是距离：越小越相似）
+    # Try distance-based filtering first (FAISS scores = distance; smaller is more similar)
     if dist_threshold is not None:
         cands = vdb.similarity_search_with_score(query, k=max(20, top_k * 5))
         picked = []
@@ -132,7 +127,7 @@ def retrieve_docs(vdb: FAISS, query: str, top_k: int, use_mmr: bool, dist_thresh
         if picked:
             return picked
 
-    # 否则退回 MMR 或普通检索
+    # Otherwise fallback to MMR or normal retrieval
     if use_mmr:
         retr = vdb.as_retriever(
             search_type="mmr",
@@ -150,37 +145,37 @@ def make_llm(model: str, base_url: str, api_key: str) -> ChatOpenAI:
     return ChatOpenAI(model=model, temperature=0.2, base_url=base_url, api_key=api_key)
 
 # -----------------------------
-# 侧边栏（确保显示）
+# Sidebar configuration
 # -----------------------------
 with st.sidebar:
-    st.header("⚙️ 设置")
+    st.header("⚙️ Settings")
 
     default_base_url = read_secret("OPENAI_BASE_URL", "https://www.dmxapi.cn/v1")
     default_api_key  = read_secret("OPENAI_API_KEY", "")
     default_embed    = read_secret("EMBEDDING_MODEL", "text-embedding-3-small")
     default_llm      = read_secret("LLM_MODEL", "gpt-4o-mini")
 
-    base_url   = st.text_input("Base URL（OpenAI 兼容）", value=default_base_url, help="例如：https://www.dmxapi.cn/v1")
-    api_key    = st.text_input("API Key（不会保存）", type="password", value=default_api_key)
-    llm_model  = st.selectbox("对话模型", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+    base_url   = st.text_input("Base URL (OpenAI compatible)", value=default_base_url, help="e.g. https://www.dmxapi.cn/v1")
+    api_key    = st.text_input("API Key (not stored)", type="password", value=default_api_key)
+    llm_model  = st.selectbox("Chat Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
                                index=0 if default_llm not in ["gpt-4o", "gpt-4.1-mini"]
                                else ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"].index(default_llm))
-    embed_model = st.text_input("Embedding 模型", value=default_embed)
+    embed_model = st.text_input("Embedding Model", value=default_embed)
 
     st.divider()
-    st.subheader("检索与切分")
-    top_k = st.slider("Top-K（返回片段数）", 1, 10, 4, 1)
-    use_mmr = st.checkbox("启用 MMR 去冗余检索", value=True)
-    use_threshold = st.checkbox("启用相似度阈值过滤（基于 FAISS 距离）", value=True)
-    dist_threshold = st.slider("距离阈值（越小越严格）", 0.10, 1.00, 0.45, 0.05, disabled=not use_threshold)
-    chunk_size = st.number_input("切片大小 chunk_size", 200, 2000, 800, 50)
-    chunk_overlap = st.number_input("切片重叠 chunk_overlap", 0, 800, 100, 10)
+    st.subheader("Retrieval & Chunking")
+    top_k = st.slider("Top-K (number of returned chunks)", 1, 10, 4, 1)
+    use_mmr = st.checkbox("Enable MMR (Maximal Marginal Relevance)", value=True)
+    use_threshold = st.checkbox("Enable similarity threshold (FAISS distance)", value=True)
+    dist_threshold = st.slider("Distance threshold (smaller = stricter)", 0.10, 1.00, 0.45, 0.05, disabled=not use_threshold)
+    chunk_size = st.number_input("Chunk size", 200, 2000, 800, 50)
+    chunk_overlap = st.number_input("Chunk overlap", 0, 800, 100, 10)
 
     st.divider()
-    clear_btn = st.button("🧹 清空会话与索引", use_container_width=True)
+    clear_btn = st.button("🧹 Clear session and index", use_container_width=True)
 
 # -----------------------------
-# 会话状态
+# Session state
 # -----------------------------
 if clear_btn:
     for k in list(st.session_state.keys()):
@@ -199,51 +194,52 @@ if "files" not in st.session_state:
     st.session_state.files = []
 
 # -----------------------------
-# 系统 Prompt
+# System prompt
 # -----------------------------
 SYSTEM_PROMPT = (
-    "你是一个文档问答助手。请优先基于下方“资料片段”回答；"
-    "若资料不足，请如实说明并给出需要补充的内容。回答条理清晰、简洁。"
+    "You are a document-based QA assistant. Always base your answer on the following 'Reference Passages'. "
+    "If the reference is insufficient, explicitly state that and suggest what additional info is needed. "
+    "Keep answers clear and concise."
 )
 PROMPT = ChatPromptTemplate.from_template(
     """{sys}
 
-资料片段：
+Reference Passages:
 {context}
 
-问题：
+Question:
 {question}
 
-请用中文简洁作答；若资料不足请直说。"""
+Please answer concisely in English. If reference data is insufficient, say so directly."""
 )
 
 # -----------------------------
-# 上传与构建索引
+# File upload & vector index building
 # -----------------------------
-st.subheader("📤 上传 DOCX 文档（可多选）")
-uploaded_files = st.file_uploader("仅支持 .docx", type=["docx"], accept_multiple_files=True)
+st.subheader("📤 Upload DOCX files (multiple allowed)")
+uploaded_files = st.file_uploader("Only .docx supported", type=["docx"], accept_multiple_files=True)
 
 c1, c2 = st.columns([1.2, 2.8])
 with c1:
-    build_btn = st.button("🚀 构建 / 更新索引", type="primary", use_container_width=True)
+    build_btn = st.button("🚀 Build / Update Index", type="primary", use_container_width=True)
 with c2:
     if st.session_state.ready and st.session_state.vectordb is not None:
-        st.success(f"索引已就绪。本次会话共载入 {len(st.session_state.files)} 个文件。")
+        st.success(f"Index ready. {len(st.session_state.files)} files loaded in this session.")
 
 if build_btn:
     if not api_key:
-        st.error("请先在侧边栏输入 API Key。")
+        st.error("Please enter your API Key in the sidebar first.")
     elif not uploaded_files:
-        st.error("请先上传至少一个 .docx 文件。")
+        st.error("Please upload at least one .docx file.")
     else:
-        with st.spinner("正在加载与切分文档…"):
+        with st.spinner("Loading and splitting documents…"):
             docs = load_docs_from_uploads(uploaded_files)
             st.session_state.files = [f.name for f in uploaded_files if f is not None]
             if not docs:
-                st.error("没有成功加载的 .docx 文档。")
+                st.error("No valid .docx files were loaded.")
             else:
                 splits = split_documents(docs, int(chunk_size), int(chunk_overlap))
-                st.info(f"已切分为 {len(splits)} 个片段。")
+                st.info(f"Split into {len(splits)} chunks.")
         try:
             st.session_state.vectordb = build_vectordb_with_progress(
                 splits,
@@ -252,28 +248,28 @@ if build_btn:
                 api_key=api_key,
             )
             st.session_state.ready = True
-            st.success("✅ 向量索引就绪！可以开始提问。")
+            st.success("✅ Vector index ready! You can start asking questions.")
         except Exception as e:
             st.exception(e)
 
 # -----------------------------
-# 聊天区
+# Chat area
 # -----------------------------
-st.subheader("💬 提问区")
+st.subheader("💬 Chat Area")
 
-# 展示历史消息
+# Display previous messages
 for role, content in st.session_state.messages:
     with st.chat_message(role):
         st.markdown(content)
 
-user_q = st.chat_input("输入你的问题…")
+user_q = st.chat_input("Type your question…")
 if user_q:
     st.session_state.messages.append(("user", user_q))
     with st.chat_message("user"):
         st.markdown(user_q)
 
     with st.chat_message("assistant"):
-        with st.spinner("思考中…"):
+        with st.spinner("Thinking…"):
             llm = make_llm(llm_model, base_url, api_key)
             use_rag = st.session_state.ready and (st.session_state.vectordb is not None)
             if use_rag:
@@ -284,23 +280,23 @@ if user_q:
                     use_mmr=bool(use_mmr),
                     dist_threshold=(float(dist_threshold) if use_threshold else None),
                 )
-                context = format_context(hits) if hits else "(未检索到相关资料)"
+                context = format_context(hits) if hits else "(No relevant reference found)"
             else:
                 hits = []
-                context = "(未构建索引，本次为无检索回答)"
+                context = "(Index not built, answering without retrieval)"
 
             msgs = PROMPT.format_messages(sys=SYSTEM_PROMPT, context=context, question=user_q)
             try:
                 resp = llm.invoke(msgs)
                 answer = resp.content if isinstance(resp, AIMessage) else str(resp)
             except Exception as e:
-                answer = f"模型调用出错：{e}"
+                answer = f"Model call error: {e}"
             st.markdown(answer)
             st.session_state.messages.append(("assistant", answer))
 
-        # 展示来源
+        # Display sources
         if hits:
-            with st.expander("📚 来源文档 / 命中片段", expanded=False):
+            with st.expander("📚 Source documents / matched chunks", expanded=False):
                 for i, d in enumerate(hits, 1):
                     src = d.metadata.get("source", "unknown")
                     snippet = (d.page_content or "").strip()
@@ -308,7 +304,6 @@ if user_q:
                     st.code(snippet[:1200])
         else:
             if use_rag:
-                st.info("未检索到相关片段，请尝试降低阈值、增大 Top-K，或上传更相关的文档。")
+                st.info("No relevant chunks found. Try lowering the threshold, increasing Top-K, or uploading more relevant docs.")
             else:
-                st.info("提示：构建索引后可获得更可靠的基于资料的回答。")
-
+                st.info("Tip: Build an index first for more accurate document-grounded answers.")
